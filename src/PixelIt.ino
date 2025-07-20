@@ -5,8 +5,7 @@
 #include <ESP8266HTTPUpdateServer.h>
 #include <ESP8266WiFi.h>
 #include <LittleFS.h>
-
-#elif defined(ESP32)
+#else
 #include <WebServer.h>
 #include <HTTPUpdateServer.h>
 #include <WiFi.h>
@@ -70,7 +69,7 @@
 #define UPDATE_BATTERY_LEVEL_INTERVAL 1000 * 30     // 30 Seconds
 
 // Version config - will be replaced by build piple with Git-Tag!
-#define VERSION "0.0.0-beta" // will be replaced by build piple with Git-Tag!
+#define VERSION "3.0.0" // will be replaced by build piple with Git-Tag!
 
 // Workaround for String in defines
 #define XSTR(x) #x
@@ -114,6 +113,8 @@ unsigned int ldrSmoothing = 0;
 // Battery stuff
 float batteryLevel = 0;
 unsigned long batteryLevelPrevMillis = 0;
+unsigned long PrevHeartbeatLEDMillis = 0;
+
 
 #ifndef MIN_BATTERY
 #define MIN_BATTERY 0
@@ -161,6 +162,8 @@ bool isESP8266 = false;
 
 #if defined(ESP32)
 TwoWire twowire(BME280_ADDRESS_ALTERNATE);
+#elif defined(ESP32S2)
+TwoWire twowire(BME280_ADDRESS_ALTERNATE);
 #elif defined(ULANZI)
 TwoWire twowire = TwoWire(0);
 #else
@@ -189,6 +192,7 @@ WiFiClient wifiClientMQTT;
 WiFiClient wifiClientHTTP;
 WiFiUDP udp;
 PubSubClient client(wifiClientMQTT);
+
 WiFiManager wifiManager;
 #if defined(ESP8266)
 ESP8266WebServer server(80);
@@ -196,8 +200,12 @@ ESP8266HTTPUpdateServer httpUpdater;
 #elif defined(ESP32)
 WebServer server(80);
 HTTPUpdateServer httpUpdater;
+#elif defined(ESP32S2)
+WebServer server(80);
+HTTPUpdateServer httpUpdater;
 #endif
 Liveview liveview;
+
 // Store last frame (serializated)
 String currentScreenJsonBuffer;
 
@@ -224,6 +232,7 @@ bool sleepMode = false;
 bool bootScreenAktiv = true;
 bool bootBatteryScreen = VBAT_PIN > 0 ? true : false;
 bool bootSound = false;
+bool IPscreenAktiv = true;
 String optionsVersion = "";
 // Millis timestamp of the last receiving screen
 unsigned long lastScreenMessageMillis = 0;
@@ -326,7 +335,7 @@ String ResetReason()
 {
 #if defined(ESP8266)
     return ESP.getResetReason();
-#elif defined(ESP32)
+#else
     switch (esp_reset_reason())
     {
     case ESP_RST_POWERON:
@@ -483,6 +492,7 @@ void SaveConfig()
     json["scrollTextDefaultDelay"] = scrollTextDefaultDelay;
     json["bootScreenAktiv"] = bootScreenAktiv;
     json["bootBatteryScreen"] = bootBatteryScreen;
+    json["IPscreenAktiv"] = IPscreenAktiv;
     json["bootSound"] = bootSound;
     json["mqttAktiv"] = mqttAktiv;
     json["mqttUser"] = mqttUser;
@@ -521,6 +531,8 @@ void SaveConfig()
     File configFile = LittleFS.open("/config.json", "w");
 #elif defined(ESP32)
     File configFile = SPIFFS.open("/config.json", "w");
+#elif defined(ESP32S2)
+    File configFile = SPIFFS.open("/config.json", "w");
 #endif
     json.printTo(configFile);
     configFile.close();
@@ -535,7 +547,7 @@ void LoadConfig()
     if (LittleFS.exists("/config.json"))
     {
         File configFile = LittleFS.open("/config.json", "r");
-#elif defined(ESP32)
+#else
     if (SPIFFS.exists("/config.json"))
     {
         File configFile = SPIFFS.open("/config.json", "r");
@@ -727,6 +739,11 @@ void SetConfigVariables(JsonObject &json)
     if (json.containsKey("bootScreenAktiv"))
     {
         bootScreenAktiv = json["bootScreenAktiv"].as<bool>();
+    }
+
+    if (json.containsKey("IPscreenAktiv"))
+    {
+        IPscreenAktiv = json["IPscreenAktiv"].as<bool>();
     }
 
     if (json.containsKey("bootBatteryScreen"))
@@ -1006,7 +1023,7 @@ void HandleFactoryReset()
     server.send(200, F("application/json"), F("{\"response\":\"OK\"}"));
 #if defined(ESP8266)
     File configFile = LittleFS.open("/config.json", "w");
-#elif defined(ESP32)
+#else
     File configFile = SPIFFS.open("/config.json", "w");
 #endif
     if (!configFile)
@@ -1859,7 +1876,7 @@ String GetConfig()
 {
 #if defined(ESP8266)
     File configFile = LittleFS.open("/config.json", "r");
-#elif defined(ESP32)
+#else
     File configFile = SPIFFS.open("/config.json", "r");
 #endif
 
@@ -2085,7 +2102,7 @@ String GetMatrixInfo()
 #if defined(ESP8266)
     root["sketchSize"] = ESP.getSketchSize();
     root["chipID"] = ESP.getChipId();
-#elif defined(ESP32)
+#else
     root["chipID"] = uint64ToString(ESP.getEfuseMac());
 #endif
 
@@ -3272,6 +3289,29 @@ void ShowBootAnimation()
     delay(1000);
 }
 
+void ShowIPaddress(String text)
+{
+    byte dots[4];
+    byte y = 0;
+    for (byte i = 0; i < text.length(); i++)
+    {
+        if (text[i] == '.')
+        {
+            dots[y] = i;
+            y++;
+        }
+    }
+    matrix->clear();
+    DrawTextHelper(text.substring(0, dots[1] + 1), false, true, false, false, true, 255, 0, 255, 0, 1);
+    matrix->show();
+    delay(2500);
+    matrix->clear();
+    DrawTextHelper(text.substring(dots[1], text.length() + 1), false, true, false, false, true, 255, 0, 255, 0, 1);
+    matrix->show();
+    delay(2500);
+    matrix->clear();
+}
+
 void ShowBatteryScreen()
 {
     const size_t capacity = JSON_ARRAY_SIZE(64) + JSON_OBJECT_SIZE(1) + 2 * JSON_OBJECT_SIZE(2) + JSON_OBJECT_SIZE(3) + 350;
@@ -3463,7 +3503,8 @@ uint8_t TranslatePin(String pin)
         return 27;
     Log(F("Pin assignment - unknown pin"), pin);
     return LED_BUILTIN;
-#elif defined(ESP32)
+
+#elif defined(CONFIG_IDF_TARGET_ESP32)
 
     if (pin == "GPIO_NUM_14")
         return (int)GPIO_NUM_14;
@@ -3494,8 +3535,51 @@ uint8_t TranslatePin(String pin)
     if (pin == "SPI_CS0_GPIO_NUM")
         return (int)SPI_CS0_GPIO_NUM;
 
-    Log(F("Pin assignment - unknown pin"), pin);
-    return (int)GPIO_NUM_32; // IDK
+     Log(F("Pin assignment ESP32 - unknown pin"), pin);
+     return (int)GPIO_NUM_32; // IDK
+
+#elif defined(CONFIG_IDF_TARGET_ESP32S2)
+
+        if (pin == "GPIO_NUM_21")
+            return (int)GPIO_NUM_21;
+        if (pin == "GPIO_NUM_16")
+            return (int)GPIO_NUM_16;
+        if (pin == "GPIO_NUM_14")
+            return (int)GPIO_NUM_14;
+        if (pin == "GPIO_NUM_13")
+            return (int)GPIO_NUM_13;
+        if (pin == "GPIO_NUM_12")
+            return (int)GPIO_NUM_12;
+        if (pin == "GPIO_NUM_11")
+            return (int)GPIO_NUM_11;
+        if (pin == "GPIO_NUM_10")
+            return (int)GPIO_NUM_10;
+        if (pin == "GPIO_NUM_9")
+            return (int)GPIO_NUM_9;
+        if (pin == "GPIO_NUM_8")
+            return (int)GPIO_NUM_8;
+        if (pin == "GPIO_NUM_7")
+            return (int)GPIO_NUM_7;
+        if (pin == "GPIO_NUM_6")
+            return (int)GPIO_NUM_6;
+        if (pin == "GPIO_NUM_5")
+            return (int)GPIO_NUM_5;
+        if (pin == "GPIO_NUM_4")
+            return (int)GPIO_NUM_4;
+        if (pin == "GPIO_NUM_38")
+            return (int)GPIO_NUM_38;
+        if (pin == "GPIO_NUM_37")
+            return (int)GPIO_NUM_37;
+        if (pin == "GPIO_NUM_33")
+            return (int)GPIO_NUM_33;
+        if (pin == "SPI_CLK_GPIO_NUM")
+            return (int)SPI_CLK_GPIO_NUM;
+        if (pin == "SPI_CS0_GPIO_NUM")
+            return (int)SPI_CS0_GPIO_NUM;
+
+        Log(F("Pin assignment ESP32S2 - unknown pin"), pin);
+        return (int)GPIO_NUM_32; // IDK
+
 #endif
 }
 
@@ -3560,11 +3644,16 @@ void initDFPlayer()
 /////////////////////////////////////////////////////////////////////
 void setup()
 {
+
 #if defined(ULANZI)
     pinMode(15, INPUT_PULLDOWN); // Fix high pitch tone
     pinMode(27, INPUT_PULLUP);   // Middle Button fix
     pinMode(26, INPUT_PULLUP);   // Left Button fix
     pinMode(VBAT_PIN, INPUT);    // Battery ADC
+#endif
+
+#if defined(ESP32S2)
+    pinMode(15, OUTPUT);
 #endif
 
     Serial.begin(115200);
@@ -3573,7 +3662,7 @@ void setup()
     Serial.println(F("Mounting file system..."));
 #if defined(ESP8266)
     if (LittleFS.begin())
-#elif defined(ESP32)
+#else
     if (SPIFFS.begin(true))
 #endif
     {
@@ -3774,7 +3863,7 @@ void setup()
     deviceID = "PixelIt-";
 #if defined(ESP8266)
     deviceID += ESP.getChipId();
-#elif defined(ESP32)
+#else
     deviceID += uint64ToString(ESP.getEfuseMac());
 #endif
     // Set hostname from config
@@ -3808,6 +3897,16 @@ void setup()
     Log(F("Setup"), WiFi.localIP().toString());
     Log(F("Setup"), WiFi.gatewayIP().toString());
     Log(F("Setup"), WiFi.subnetMask().toString());
+
+    if (IPscreenAktiv)
+    {
+        Log(F("Setup"), F("Show IP"));
+        ShowIPaddress(WiFi.localIP().toString());
+    }
+    else
+    {
+        Log(F("Setup"), F("Do not show IP"));
+    }
 
     Log(F("Setup"), F("Starting UDP"));
     udp.begin(2390);
@@ -3876,6 +3975,7 @@ void displayUpdateScreen()
 
 void checkUpdate()
 {
+
     Log(F("CheckUpdate"), F("Checking..."));
     HttpClient httpClient = HttpClient(wifiClientHTTP, CHECKUPDATE_SERVER_HOST, CHECKUPDATE_SERVER_PORT);
     httpClient.sendHeader("User-Agent", "PixelIt");
@@ -3915,10 +4015,31 @@ void checkUpdate()
     }
 }
 
+#if defined(ESP32S2)
+void HeartbeatLED()
+{
+    if ( digitalRead(15) == LOW ) {
+        digitalWrite(15, HIGH);
+    } else {
+        digitalWrite(15, LOW);
+    }
+}
+#endif
+
 void loop()
 {
+
     server.handleClient();
     webSocket.loop();
+
+   // Heartbeat LED
+    #if defined(ESP32S2)
+    if (millis() - PrevHeartbeatLEDMillis >= 1000)
+    {
+        PrevHeartbeatLEDMillis = millis();
+        HeartbeatLED();
+    }
+    #endif
 
     // Update Battery level
     if (millis() - batteryLevelPrevMillis >= UPDATE_BATTERY_LEVEL_INTERVAL)
