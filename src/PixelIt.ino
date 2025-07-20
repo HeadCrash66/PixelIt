@@ -3566,6 +3566,8 @@ uint8_t TranslatePin(String pin)
             return (int)GPIO_NUM_5;
         if (pin == "GPIO_NUM_4")
             return (int)GPIO_NUM_4;
+        if (pin == "GPIO_NUM_39")
+            return (int)GPIO_NUM_39;
         if (pin == "GPIO_NUM_38")
             return (int)GPIO_NUM_38;
         if (pin == "GPIO_NUM_37")
